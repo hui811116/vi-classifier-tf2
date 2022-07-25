@@ -12,4 +12,5 @@ Variational Inference-Based Classifier Reproduced for Tensorflow 2.0
 
     python3 run.py vib
 or
+
     python3 run.py nib
