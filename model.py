@@ -245,3 +245,123 @@ class vIB(keras.Model):
 	def call(self,data):
 		_,_,z = self.encoder(data,training=False)
 		return self.decoder(z,training=False)
+
+# Bernoulli sampling
+# Should use a relaxation: the Grumble-Softmax function
+# Then the training and testing phase behavior is different
+# during testing time, feed the decoder with 0/1 samples
+# but it is trained with relaxed 0/1 samples.
+class BernoulliSampling(layers.Layer):
+	def call(self,inputs,training=False):
+		# the input is the logits
+		if training:
+			# use smooth relaxation of the zero-one function
+			z_logits = inputs #the is the log-likelihood ratio log(v/(1-v))
+			cdf = tf.random.uniform(shape=(tf.shape(z_logits)))
+			log_prob = tf.math.log(cdf+1e-9)-tf.math.log(1-cdf+1e-9)
+			return tf.nn.sigmoid(z_logits-log_prob)
+		else:
+			z_logits = inputs
+			z_prob = tf.nn.sigmoid(z_logits)
+			cdf = tf.random.uniform(shape=(tf.shape(z_logits)))
+			return tf.cast(z_prob>cdf,dtype=tf.float32)
+
+# Variational Bernoulli Information Bottleneck
+class vBIB(keras.Model):
+	def __init__(self,gamma,latent_dim,name=None,**kwargs):
+		super(vBIB,self).__init__(name=name)
+		self.gamma = gamma
+		self.latent_dim = latent_dim
+		self.img_width = 28
+		self.img_ch    = 1
+		self.nclass    = 10
+		# model
+		enc_input = keras.Input(shape=(self.img_width,self.img_width,self.img_ch))
+		x = layers.Conv2D(16,3,activation="relu",strides=2,padding="same")(enc_input)
+		x = layers.Conv2D(16,3,activation="relu",strides=2,padding="same")(x)
+		x = layers.Flatten()(x)
+		# predicting the logits for Bernoulli
+		z_logits = layers.Dense(self.latent_dim,activation="linear")(x)
+		z = BernoulliSampling()(z_logits)
+		self.encoder = keras.Model(enc_input,[z_logits,z],name="encoder")
+
+		# decoder
+		dec_input = keras.Input(shape=(self.latent_dim))
+		dec_output = layers.Dense(self.nclass,activation="linear")(dec_input)
+		self.decoder = keras.Model(dec_input,dec_output,name="decoder")
+		# losses
+		self.total_loss_tracker = keras.metrics.Mean(name="total_loss")
+		self.ce_loss_tracker    = keras.metrics.Mean(name="ce_loss")
+		self.mi_loss_tracker    = keras.metrics.Mean(name="mi_loss")
+		self.acc_tracker        = keras.metrics.SparseCategoricalAccuracy(name="accuracy")
+		self.test_total_loss_tracker= keras.metrics.Mean(name="val_total_loss")
+		self.test_ce_loss_tracker   = keras.metrics.Mean(name="val_ce_loss")
+		self.test_mi_loss_tracker   = keras.metrics.Mean(name="val_mi_loss")
+		self.test_acc_tracker       = keras.metrics.SparseCategoricalAccuracy(name="val_accuracy")
+	@property
+	def metrics(self):
+		return [
+			self.total_loss_tracker,
+			self.ce_loss_tracker,
+			self.mi_loss_tracker,
+			self.acc_tracker,
+			self.test_total_loss_tracker,
+			self.test_ce_loss_tracker,
+			self.test_mi_loss_tracker,
+			self.test_acc_tracker,
+		]
+	def train_step(self,data):
+		x_data, y_label = data
+		with tf.GradientTape() as tape:
+			z_logits, z = self.encoder(x_data,training=True)
+			logits = self.decoder(z,training=True)
+			# calculate losses
+			soft_out = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_label,logits=logits)
+			ce_loss =tf.reduce_mean(soft_out)
+			# calculate kl loss
+			kl_loss = tf.reduce_mean(
+					tf.reduce_sum(
+							tf.math.log(2.0)+z_logits *tf.nn.sigmoid(z_logits)-tf.math.softplus(z_logits), axis=1
+						)
+				)
+			total_loss = self.gamma*kl_loss + ce_loss
+			# update
+		grads = tape.gradient(total_loss,self.trainable_variables)
+		self.optimizer.apply_gradients(zip(grads,self.trainable_variables))
+		self.total_loss_tracker.update_state(total_loss)
+		self.ce_loss_tracker.update_state(ce_loss)
+		self.mi_loss_tracker.update_state(kl_loss)
+		self.acc_tracker.update_state(y_label,logits)
+		return {
+			"accuracy":self.acc_tracker.result(),
+			"total_loss":self.total_loss_tracker.result(),
+			"ce_loss":self.ce_loss_tracker.result(),
+			"mi_loss":self.mi_loss_tracker.result(),
+		}
+	def test_step(self,inputs):
+		x_data, y_label = inputs
+		z_logits, z = self.encoder(x_data,training=False)
+		logits = self.decoder(z,training=False)
+		# losses
+		soft_out = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_label,logits=logits)
+		ce_loss = tf.reduce_mean(soft_out)
+		# calculate kl loss
+		mi_loss = tf.reduce_mean(
+				tf.reduce_sum(
+						tf.math.log(2.0)+z_logits * tf.nn.sigmoid(z_logits)-tf.math.softplus(z_logits), axis=1
+					)
+			)
+		total_loss = self.gamma * mi_loss + ce_loss
+		self.test_total_loss_tracker.update_state(total_loss)
+		self.test_ce_loss_tracker.update_state(ce_loss)
+		self.test_mi_loss_tracker.update_state(mi_loss)
+		self.test_acc_tracker.update_state(y_label,logits)
+		return {
+			"accuracy": self.test_acc_tracker.result(),
+			"total_loss":self.test_total_loss_tracker.result(),
+			"ce_loss":self.test_ce_loss_tracker.result(),
+			"mi_loss":self.test_mi_loss_tracker.result(),
+		}
+	def call(self,data):
+		_,z = self.encoder(data,training=False)
+		return self.decoder(z,training=False)

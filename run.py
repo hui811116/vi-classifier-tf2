@@ -7,7 +7,7 @@ import sys
 import os
 
 parser = argparse.ArgumentParser()
-parser.add_argument("model", choices=["vib","nib"])
+parser.add_argument("model", choices=["vib","nib","vbib"])
 parser.add_argument("--latent_dim", type=int, default=16, help="Latent Dimension")
 parser.add_argument("--batch_size", type=int, default=256, help="mini-batch size")
 parser.add_argument("--epochs", type=int, default=50, help="number of epochs (no early stopping)")
@@ -80,6 +80,8 @@ for gidx, gamma in enumerate(gamma_range):
 			model = mds.vIB(gamma,args.latent_dim)
 		elif args.model == "nib":
 			model = mds.nIB(gamma,args.latent_dim)
+		elif args.model == "vbib":
+			model = mds.vBIB(gamma,args.latent_dim)
 		else:
 			sys.exit("Error: undefined model {:}, abort".format(args.model))
 
