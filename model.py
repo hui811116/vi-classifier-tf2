@@ -266,6 +266,30 @@ class BernoulliSampling(layers.Layer):
 			cdf = tf.random.uniform(shape=(tf.shape(z_logits)))
 			return tf.cast(z_prob>cdf,dtype=tf.float32)
 
+def createVbEnc(latent_dim,img_width,img_chs):
+	# model
+	enc_input = keras.Input(shape=(img_width,img_width,img_chs))
+	x = layers.Conv2D(8,3,activation="relu",strides=2,padding="same")(enc_input)
+	x = layers.Conv2D(8,3,activation="relu",strides=2,padding="same")(x)
+	x = layers.Flatten()(x)
+	# predicting the logits for Bernoulli
+	z_logits = layers.Dense(latent_dim,activation="linear")(x)
+	z = BernoulliSampling()(z_logits)
+	#self.encoder = keras.Model(enc_input,[z_logits,z],name="encoder")
+	return keras.Model(enc_input,[z_logits,z],name="encoder")
+
+def createVbDec(latent_dim,img_width,img_chs,ld_chs):
+	dec_input = keras.Input(shape=(latent_dim))
+	lat_width = int(img_width/4) # two stack
+	lat_prod = int(img_width * img_width * ld_chs / (4**2))
+	x = layers.Dense(lat_prod,activation="relu")(dec_input)
+	x = layers.Reshape(target_shape=(lat_width,lat_width,ld_chs))(x)
+	x = layers.Conv2DTranspose(8,3,activation="relu",strides=2,padding="same")(x)
+	x = layers.Conv2DTranspose(8,3,activation="relu",strides=2,padding="same")(x)
+	dec_logits = layers.Conv2DTranspose(img_chs,3,activation=None,strides=1,padding="same")(x)
+	return keras.Model(dec_input,dec_logits,name="decoder")
+
+
 # Variational Bernoulli Information Bottleneck
 class vBIB(keras.Model):
 	def __init__(self,gamma,latent_dim,name=None,**kwargs):
@@ -276,15 +300,7 @@ class vBIB(keras.Model):
 		self.img_ch    = 1
 		self.nclass    = 10
 		# model
-		enc_input = keras.Input(shape=(self.img_width,self.img_width,self.img_ch))
-		x = layers.Conv2D(16,3,activation="relu",strides=2,padding="same")(enc_input)
-		x = layers.Conv2D(16,3,activation="relu",strides=2,padding="same")(x)
-		x = layers.Flatten()(x)
-		# predicting the logits for Bernoulli
-		z_logits = layers.Dense(self.latent_dim,activation="linear")(x)
-		z = BernoulliSampling()(z_logits)
-		self.encoder = keras.Model(enc_input,[z_logits,z],name="encoder")
-
+		self.encoder = createVbEnc(latent_dim,28,1)
 		# decoder
 		dec_input = keras.Input(shape=(self.latent_dim))
 		dec_output = layers.Dense(self.nclass,activation="linear")(dec_input)
@@ -364,4 +380,96 @@ class vBIB(keras.Model):
 		}
 	def call(self,data):
 		_,z = self.encoder(data,training=False)
+		return self.decoder(z,training=False)
+
+class vBAE(keras.Model):
+	def __init__(self,latent_dim,name=None,**kwargs):
+		super(vBAE,self).__init__(name=name)
+		self.latent_dim = latent_dim
+		self.img_width = 28
+		self.img_chs    = 1
+		# model
+		self.encoder = createVbEnc(latent_dim,self.img_width,self.img_chs)
+		self.encoder.summary()
+		self.decoder = createVbDec(latent_dim,self.img_width,self.img_chs,8)
+		self.decoder.summary()
+
+		self.total_loss_tracker = keras.metrics.Mean(name="total")
+		self.mi_loss_tracker = keras.metrics.Mean(name="mi")
+		self.bce_loss_tracker = keras.metrics.Mean(name="bce")
+		self.test_total_loss_tracker = keras.metrics.Mean(name="val_total")
+		self.test_mi_loss_tracker = keras.metrics.Mean(name="val_mi")
+		self.test_bce_loss_tracker = keras.metrics.Mean(name="val_bce")
+		self.test_mse_loss_tracker = keras.metrics.Mean(name="val_mse")
+	@property
+	def metrics(self):
+		return [self.total_loss_tracker,
+						self.mi_loss_tracker,
+						self.bce_loss_tracker,
+						self.test_total_loss_tracker,
+						self.test_mi_loss_tracker,
+						self.test_bce_loss_tracker,
+						self.test_mse_loss_tracker,]
+	def train_step(self,data):
+		# x_in == x_out, can be supervised denoising as well
+		x_in, x_out = data
+		sum_axis = tf.range(1,tf.size(tf.shape(x_in)))
+		with tf.GradientTape() as tape:
+			z_logits, z = self.encoder(x_in,training=True)
+			x_re = self.decoder(z,training=True)
+			kl_loss = tf.reduce_mean(
+					tf.reduce_sum(
+							tf.math.log(2.0)+z_logits * tf.nn.sigmoid(z_logits) - tf.math.softplus(z_logits), axis=1
+						)
+				)
+			bce_loss = tf.reduce_mean(
+					tf.reduce_sum(
+							tf.nn.sigmoid_cross_entropy_with_logits(labels=x_out,logits=x_re),axis=sum_axis,
+						)
+				)
+			total_loss = kl_loss + bce_loss
+		grads = tape.gradient(total_loss,self.trainable_variables)
+		self.optimizer.apply_gradients(zip(grads,self.trainable_variables))
+		self.total_loss_tracker.update_state(total_loss)
+		self.mi_loss_tracker.update_state(kl_loss)
+		self.bce_loss_tracker.update_state(bce_loss)
+		return {
+			"total":self.total_loss_tracker.result(),
+			"bce":self.bce_loss_tracker.result(),
+			"kl":self.mi_loss_tracker.result(),
+		}
+
+	def test_step(self,data):
+		x_in, x_out = data
+		batch_size = tf.cast(tf.shape(x_in)[0],tf.float32)
+		sum_axis = tf.range(1,tf.size(tf.shape(x_in)))
+		z_logits, z = self.encoder(x_in,training=False)
+		x_re = self.decoder(z,training=False)
+		kl_loss = tf.reduce_mean(
+				tf.reduce_sum(
+						tf.math.log(2.0) + z_logits * tf.nn.sigmoid(z_logits) - tf.math.softplus(z_logits), axis=1
+					)
+			)
+		bce_loss = tf.reduce_mean(
+				tf.reduce_sum(
+						tf.nn.sigmoid_cross_entropy_with_logits(labels=x_out,logits=x_re),axis=sum_axis,
+					)
+			)
+		total_loss = kl_loss + bce_loss
+		# mse for comparison
+		mse_loss = (2.0/batch_size) * tf.nn.l2_loss(tf.nn.sigmoid(x_re)-x_out)
+		self.test_total_loss_tracker.update_state(total_loss)
+		self.test_mi_loss_tracker.update_state(kl_loss)
+		self.test_bce_loss_tracker.update_state(bce_loss)
+		self.test_mse_loss_tracker.update_state(mse_loss)
+		return {
+			"total":self.test_total_loss_tracker.result(),
+			"bce":self.test_bce_loss_tracker.result(),
+			"kl":self.test_mi_loss_tracker.result(),
+			"mse":self.test_mse_loss_tracker.result(),
+		}
+
+	def call(self,data):
+		x_in = data
+		_, z = self.encoder(x_in,training=False)
 		return self.decoder(z,training=False)
