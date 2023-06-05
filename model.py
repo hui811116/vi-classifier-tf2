@@ -125,7 +125,7 @@ class nIB(keras.Model):
 		}
 	def call(self,data):
 		_,_,z = self.encoder(data,training=False)
-		return self.decoder(z,training=False)
+		return self.decoder(z,training=False), z
 
 '''
 Reproduced from:
@@ -244,7 +244,7 @@ class vIB(keras.Model):
 		}
 	def call(self,data):
 		_,_,z = self.encoder(data,training=False)
-		return self.decoder(z,training=False)
+		return self.decoder(z,training=False), z
 
 # Bernoulli sampling
 # Should use a relaxation: the Grumble-Softmax function
@@ -289,6 +289,33 @@ def createVbDec(latent_dim,img_width,img_chs,ld_chs):
 	dec_logits = layers.Conv2DTranspose(img_chs,3,activation=None,strides=1,padding="same")(x)
 	return keras.Model(dec_input,dec_logits,name="decoder")
 
+def createVgEnc(latent_dim,img_width,img_chs):
+	# model
+	enc_input = keras.Input(shape=(img_width,img_width,img_chs))
+	x = layers.Conv2D(8,3,activation="relu",strides=2,padding="same")(enc_input)
+	x = layers.Conv2D(8,3,activation="relu",strides=2,padding="same")(x)
+	x = layers.Flatten()(x)
+	# predicting the logits for Bernoulli
+	#z_logits = layers.Dense(latent_dim,activation="linear")(x)
+	#z = BernoulliSampling()(z_logits)
+	z_mean = layers.Dense(latent_dim,activation="linear")(x)
+	z_log_var = layers.Dense(latent_dim,activation="linear")(x)
+	z = Sampling()([z_mean,z_log_var])
+	#self.encoder = keras.Model(enc_input,[z_logits,z],name="encoder")
+	return keras.Model(enc_input,[z_mean,z_log_var,z],name="encoder")
+
+'''
+def createVgDec(latent_dim,img_width,img_chs,ld_chs):
+	dec_input = keras.Input(shape=(latent_dim))
+	lat_width = int(img_width/4) # two stack
+	lat_prod = int(img_width * img_width * ld_chs / (4**2))
+	x = layers.Dense(lat_prod,activation="relu")(dec_input)
+	x = layers.Reshape(target_shape=(lat_width,lat_width,ld_chs))(x)
+	x = layers.Conv2DTranspose(8,3,activation="relu",strides=2,padding="same")(x)
+	x = layers.Conv2DTranspose(8,3,activation="relu",strides=2,padding="same")(x)
+	dec_logits = layers.Conv2DTranspose(img_chs,3,activation=None,strides=1,padding="same")(x)
+	return keras.Model(dec_input,dec_logits,name="decoder")
+'''
 
 # Variational Bernoulli Information Bottleneck
 class vBIB(keras.Model):
@@ -380,7 +407,7 @@ class vBIB(keras.Model):
 		}
 	def call(self,data):
 		_,z = self.encoder(data,training=False)
-		return self.decoder(z,training=False)
+		return self.decoder(z,training=False), z
 
 class vBAE(keras.Model):
 	def __init__(self,latent_dim,name=None,**kwargs):
@@ -472,4 +499,212 @@ class vBAE(keras.Model):
 	def call(self,data):
 		x_in = data
 		_, z = self.encoder(x_in,training=False)
-		return self.decoder(z,training=False)
+		return self.decoder(z,training=False), z
+
+class vAE(keras.Model):
+	def __init__(self,latent_dim,name=None,**kwargs):
+		super(vAE,self).__init__(name=name)
+		self.latent_dim = latent_dim
+		self.img_width = 28
+		self.img_chs    = 1
+		# model
+		#self.encoder = createVbEnc(latent_dim,self.img_width,self.img_chs)
+		self.encoder = createVgEnc(latent_dim,self.img_width,self.img_chs)
+		self.encoder.summary()
+		# reused the decoder architecture
+		self.decoder = createVbDec(latent_dim,self.img_width,self.img_chs,8)
+		self.decoder.summary()
+
+		self.total_loss_tracker = keras.metrics.Mean(name="total")
+		self.mi_loss_tracker = keras.metrics.Mean(name="mi")
+		self.bce_loss_tracker = keras.metrics.Mean(name="bce")
+		self.test_total_loss_tracker = keras.metrics.Mean(name="val_total")
+		self.test_mi_loss_tracker = keras.metrics.Mean(name="val_mi")
+		self.test_bce_loss_tracker = keras.metrics.Mean(name="val_bce")
+		self.test_mse_loss_tracker = keras.metrics.Mean(name="val_mse")
+	@property
+	def metrics(self):
+		return [self.total_loss_tracker,
+						self.mi_loss_tracker,
+						self.bce_loss_tracker,
+						self.test_total_loss_tracker,
+						self.test_mi_loss_tracker,
+						self.test_bce_loss_tracker,
+						self.test_mse_loss_tracker,]
+	def train_step(self,data):
+		# x_in == x_out, can be supervised denoising as well
+		x_in, x_out = data
+		sum_axis = tf.range(1,tf.size(tf.shape(x_in)))
+		with tf.GradientTape() as tape:
+			z_mean,z_log_var, z = self.encoder(x_in,training=True)
+			x_re = self.decoder(z,training=True)
+			kl_loss = tf.reduce_mean(
+					tf.reduce_sum(
+							-0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var)), axis=1
+						)
+				)
+			bce_loss = tf.reduce_mean(
+					tf.reduce_sum(
+							tf.nn.sigmoid_cross_entropy_with_logits(labels=x_out,logits=x_re),axis=sum_axis,
+						)
+				)
+			total_loss = kl_loss + bce_loss
+		grads = tape.gradient(total_loss,self.trainable_variables)
+		self.optimizer.apply_gradients(zip(grads,self.trainable_variables))
+		self.total_loss_tracker.update_state(total_loss)
+		self.mi_loss_tracker.update_state(kl_loss)
+		self.bce_loss_tracker.update_state(bce_loss)
+		return {
+			"total":self.total_loss_tracker.result(),
+			"bce":self.bce_loss_tracker.result(),
+			"kl":self.mi_loss_tracker.result(),
+		}
+
+	def test_step(self,data):
+		x_in, x_out = data
+		batch_size = tf.cast(tf.shape(x_in)[0],tf.float32)
+		sum_axis = tf.range(1,tf.size(tf.shape(x_in)))
+		z_mean, z_log_var, z = self.encoder(x_in,training=False)
+		x_re = self.decoder(z,training=False)
+		kl_loss = tf.reduce_mean(
+				tf.reduce_sum(
+						-0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var)), axis=1
+					)
+			)
+		bce_loss = tf.reduce_mean(
+				tf.reduce_sum(
+						tf.nn.sigmoid_cross_entropy_with_logits(labels=x_out,logits=x_re),axis=sum_axis,
+					)
+			)
+		total_loss = kl_loss + bce_loss
+		# mse for comparison
+		mse_loss = (2.0/batch_size) * tf.nn.l2_loss(tf.nn.sigmoid(x_re)-x_out)
+		self.test_total_loss_tracker.update_state(total_loss)
+		self.test_mi_loss_tracker.update_state(kl_loss)
+		self.test_bce_loss_tracker.update_state(bce_loss)
+		self.test_mse_loss_tracker.update_state(mse_loss)
+		return {
+			"total":self.test_total_loss_tracker.result(),
+			"bce":self.test_bce_loss_tracker.result(),
+			"kl":self.test_mi_loss_tracker.result(),
+			"mse":self.test_mse_loss_tracker.result(),
+		}
+
+	def call(self,data):
+		x_in = data
+		_, _, z = self.encoder(x_in,training=False)
+		return self.decoder(z,training=False), z
+
+class vBQ(keras.Model):
+	def __init__(self,latent_dim,src_vae,src_latent_dim,gamma,name=None,**kwargs):
+		super(vBQ,self).__init__(name=name)
+		self.latent_dim = latent_dim
+		# fixed modules
+		self.src_vae = src_vae
+		self.gamma = gamma
+		# model
+		enc_input = keras.Input(shape=(src_latent_dim,))
+		x = layers.Dense(64,activation=None)(enc_input)
+		#x = layers.BatchNormalization()(x)
+		x = layers.LeakyReLU()(x)
+		x = layers.Dense(64,activation=None)(x)
+		#x = layers.BatchNormalization()(x)
+		z_logits = layers.Dense(latent_dim,activation=None)(x)
+		z = BernoulliSampling()(z_logits)
+		self.encoder = keras.Model(enc_input,[z_logits,z],name="encoder")
+		self.encoder.summary()
+
+		dec_input = keras.Input(shape=(latent_dim,))
+		x = layers.Dense(64,activation=None)(dec_input)
+		#x = layers.BatchNormalization()(x)
+		x = layers.LeakyReLU()(x)
+		x = layers.Dense(64,activation=None)(x)
+		#x = layers.BatchNormalization()(x)
+		x = layers.LeakyReLU()(x)
+		dec_out = layers.Dense(src_latent_dim,activation=None)(x)
+		self.decoder = keras.Model(dec_input,dec_out,name="decoder")
+		self.decoder.summary()
+
+		self.total_loss_tracker = keras.metrics.Mean(name="total")
+		self.mi_loss_tracker = keras.metrics.Mean(name="mi")
+		#self.bce_loss_tracker = keras.metrics.Mean(name="bce")
+		self.mse_loss_tracker = keras.metrics.Mean(name="mse")
+		self.test_total_loss_tracker = keras.metrics.Mean(name="val_total")
+		self.test_mi_loss_tracker = keras.metrics.Mean(name="val_mi")
+		#self.test_bce_loss_tracker = keras.metrics.Mean(name="val_bce")
+		self.test_mse_loss_tracker = keras.metrics.Mean(name="val_mse")
+	@property
+	def metrics(self):
+		return [self.total_loss_tracker,
+						self.mi_loss_tracker,
+						self.mse_loss_tracker,
+						self.test_total_loss_tracker,
+						self.test_mi_loss_tracker,
+						#self.test_bce_loss_tracker,
+						self.test_mse_loss_tracker,]
+	def train_step(self,data):
+		# x_in == x_out, can be supervised denoising as well
+		x_in, x_out = data
+		# transform the source into embeddings
+		_,_,q_in = self.src_vae.encoder(x_in,training=False) # no gradients
+		batch_size = tf.cast(tf.shape(q_in)[0],tf.float32)
+		sum_axis = tf.range(1,tf.size(tf.shape(q_in)))
+		with tf.GradientTape() as tape:
+			z_logits, z = self.encoder(q_in,training=True)
+			q_re = self.decoder(z,training=True)
+			kl_loss = tf.reduce_mean(
+					tf.reduce_sum(
+							tf.math.log(2.0)+z_logits * tf.nn.sigmoid(z_logits) - tf.math.softplus(z_logits), axis=1
+						)
+				)
+			mse_loss = (2.0/batch_size) * tf.nn.l2_loss(tf.nn.sigmoid(q_re)-q_in)
+			total_loss = kl_loss*self.gamma + mse_loss
+		grads = tape.gradient(total_loss,self.trainable_variables)
+		self.optimizer.apply_gradients(zip(grads,self.trainable_variables))
+		self.total_loss_tracker.update_state(total_loss)
+		self.mi_loss_tracker.update_state(kl_loss)
+		self.mse_loss_tracker.update_state(mse_loss)
+		return {
+			"total":self.total_loss_tracker.result(),
+			"mse":self.mse_loss_tracker.result(),
+			"kl":self.mi_loss_tracker.result(),
+		}
+
+	def test_step(self,data):
+		x_in, x_out = data
+		# transform domain
+		_,_,q_in = self.src_vae.encoder(x_in,training=False)
+		batch_size = tf.cast(tf.shape(q_in)[0],tf.float32)
+		sum_axis = tf.range(1,tf.size(tf.shape(q_in)))
+		z_logits, z = self.encoder(q_in,training=False)
+		q_re = self.decoder(z,training=False)
+		kl_loss = tf.reduce_mean(
+				tf.reduce_sum(
+						tf.math.log(2.0) + z_logits * tf.nn.sigmoid(z_logits) - tf.math.softplus(z_logits), axis=1
+					)
+			)
+		#bce_loss = tf.reduce_mean(
+		#		tf.reduce_sum(
+		#				tf.nn.sigmoid_cross_entropy_with_logits(labels=q_in,logits=q_re),axis=sum_axis,
+		#			)
+		#	)
+		# mse for comparison
+		mse_loss = (2.0/batch_size) * tf.nn.l2_loss(tf.nn.sigmoid(q_re)-q_in)
+		total_loss = kl_loss * self.gamma + mse_loss
+
+		self.test_total_loss_tracker.update_state(total_loss)
+		self.test_mi_loss_tracker.update_state(kl_loss)
+		#self.test_bce_loss_tracker.update_state(bce_loss)
+		self.test_mse_loss_tracker.update_state(mse_loss)
+		return {
+			"total":self.test_total_loss_tracker.result(),
+			#"bce":self.test_bce_loss_tracker.result(),
+			"kl":self.test_mi_loss_tracker.result(),
+			"mse":self.test_mse_loss_tracker.result(),
+		}
+
+	def call(self,data):
+		x_in = data
+		_,_,q_in = self.src_vae.encoder(x_in,training=False)
+		_, z = self.encoder(q_in,training=False)
+		return self.decoder(z,training=False), z
